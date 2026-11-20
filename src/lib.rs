@@ -517,11 +517,10 @@ impl<'a> Converter<'a> {
                 }
                 for (name, types) in fields {
                     let ty = unique_types(types).join(" | ");
-                    out.push_str(&format!(
-                        "\t{}: {},\n",
-                        field_key(&name),
-                        optional_type(&ty)
-                    ));
+                    // Extern-type members are declaration-block members, not
+                    // table-type fields: Luau requires newline separators and
+                    // rejects trailing commas here.
+                    out.push_str(&format!("\t{}: {}\n", field_key(&name), optional_type(&ty)));
                 }
             }
         }
@@ -1204,7 +1203,8 @@ mod tests {
         );
         assert!(defs.contains("export type ImportNamespace ="), "{defs}");
 
-        let converter = Converter::new(&lad, &Options::default());
+        let binding = Options::default();
+        let converter = Converter::new(&lad, &binding);
         for (namespace, expected_type) in &converter.namespace_names {
             let escaped = escape_luau_string(namespace);
             assert!(
@@ -1279,6 +1279,33 @@ mod tests {
         );
         assert!(!defs.contains("declare class "), "{defs}");
         assert!(defs.contains("export type Namespace_"), "{defs}");
+    }
+
+    #[test]
+    fn extern_type_enum_fields_are_not_comma_separated() {
+        let lad = ladfile::parse_lad_file(ladfile::EXAMPLE_LADFILE).unwrap();
+        let defs = lad_to_luau(&lad);
+
+        // Class/extern-type bodies use newline-separated members. Commas are
+        // valid in table type aliases, but invalid in these declaration blocks.
+        let mut in_extern_type = false;
+        for line in defs.lines() {
+            if line.starts_with("declare extern type ") {
+                in_extern_type = true;
+                continue;
+            }
+            if in_extern_type && line == "end" {
+                in_extern_type = false;
+                continue;
+            }
+            if in_extern_type {
+                let trimmed = line.trim();
+                assert!(
+                    !trimmed.ends_with(','),
+                    "extern type members must not end with commas: {trimmed}"
+                );
+            }
+        }
     }
 
     #[test]
