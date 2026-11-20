@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Make `LuauLadPlugin` write to `luau/bindings.d.luau` by default, separate
+  from BMS's generated LuaLS `.d.lua` files, and create parent directories for
+  nested definition and FFlag output paths.
+- Document separate Luau-LSP and LuaLS workspace configuration. The BMS root
+  `bindings.d.lua` already declares shared types such as `ReflectReference` and
+  `NoFields`; LuaLS must index the complete definitions directory.
+- Add regression tests for native Luau output and nested plugin output paths.
+
+## [0.3.0] - 2026-11-19
+
+Update the backend to the BMS 0.24 / LAD 0.24 schema. This is a breaking
+compatibility boundary: the crate now requires `ladfile = 0.24.0`.
+
+### Changed
+
+- **BMS/LAD 0.24.0.** Reworked conversion for `LadFile.namespaces`, typed
+  namespace values, generic type templates, `Type<T>` values, and the explicit
+  function receiver/generic metadata. Removed assumptions about the old globals
+  table and argument-shape-based phantom registration rewrite.
+- **Namespaces.** Emit a Luau type table for every LAD namespace and literal
+  overloads for `import_namespace`, with typed namespace functions and values.
+  Global builtins are generated from the remaining LAD global-function set.
+- **Methods and type values.** Render receiver functions as Luau methods,
+  preserve generic function parameters, and intersect type registrations with
+  their corresponding static type-member tables.
+- **Enums and constructor data.** Retain enum variant unions and variant
+  function tables. Constructor payload aliases now use the 0.24 layout and
+  default metadata; tuple positional fields are deliberately omitted rather than
+  emitted as invalid table keys.
+- **Integration test.** Upgrade the headless test app to BMS 0.24.0 and Bevy
+  0.20.0, register a custom `game` namespace, and type-check its generated API.
+- **MSRV.** Keep Rust 1.95, the minimum declared by Bevy ECS 0.20.
+- **CLI and public API.** Preserve `lad-luau`, `LuauLadPlugin`, the `FFLAGS`
+  helpers, and the `Options::init_types` switch.
+
 ## [0.2.0] - 2026-08-26
 
 Support for `bevy_mod_scripting` 0.20–0.21 (`ladfile` 0.20–0.21). Feature-wise
@@ -129,6 +166,7 @@ Initial release: a native Luau (`.d.luau`) LAD backend, supporting
   field key cannot be: it is what reflect indexing uses at runtime, so a renamed
   field would be backed by nothing.
 
-[Unreleased]: https://github.com/jonasdedden/luau_lad_backend/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jonasdedden/luau_lad_backend/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jonasdedden/luau_lad_backend/releases/tag/v0.3.0
 [0.2.0]: https://github.com/jonasdedden/luau_lad_backend/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jonasdedden/luau_lad_backend/releases/tag/v0.1.0

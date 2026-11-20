@@ -6,142 +6,75 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue)](https://github.com/jonasdedden/luau_lad_backend/blob/main/Cargo.toml)
 
 A native **Luau** (`.d.luau`) definition-file backend for
-[`bevy_mod_scripting`](https://github.com/makspll/bevy_mod_scripting) (BMS) LAD
-(Language Agnostic Definition) files, so Luau game scripts can be type-checked
-with [`luau-lsp`](https://github.com/JohnnyMorganz/luau-lsp).
+[`bevy_mod_scripting`](https://github.com/makspll/bevy_mod_scripting) (BMS)
+Language Agnostic Definition (LAD) files. The generated definitions let
+[`luau-lsp`](https://github.com/JohnnyMorganz/luau-lsp) type-check scripts
+against the API exposed by a Rust/Bevy application.
 
-BMS ships LAD post-processors for the Lua Language Server (`--- @class` `.lua`)
-and mdbook, but no native Luau one — and `luau-lsp` can't consume the LuaLS
-dialect. This is that missing backend.
+This release targets the BMS 0.24 LAD schema. That schema describes script
+namespaces, typed type values, generic parameters, and explicit method
+receivers; it is a breaking change from earlier LAD versions.
 
-## Design
+## Compatibility
 
-- **Every type is declared dynamically.** All types in the LAD file get a
-  `declare extern type … end`; nothing is hard-coded (`World`, `Entity`, etc. are just
-  types in the file) and nothing is restricted to components/resources.
-- **Optional only where it is earned.** A plain struct's fields are always
-  present on a live reference, so they are declared non-optional (`x: number`) —
-  no `or 0` at every use site. Fields of an *enum's* struct variants stay
-  optional (`level: number?`): they belong to one variant, and the value may
-  currently be another.
-- **Documented arguments and returns.** `ladfile_builder` parses the
-  `Arguments:` / `Returns:` sections out of a Rust doc comment into structured
-  entries and truncates the main docstring there, so rendering only the main
-  docstring silently loses them. They are emitted as `@param` / `@return` lines
-  whose names match the rendered signature:
+| `luau_lad_backend` | `ladfile` / BMS | Bevy (integration test) | MSRV |
+| --- | --- | --- | --- |
+| 0.3.x | 0.24.x | 0.20.0 | 1.95 |
+| 0.2.x | 0.20–0.21 | 0.18–0.19 | 1.95 |
+| 0.1.x | 0.17–0.19 | 0.16–0.18 | 1.89 |
 
-  ```luau
-  -- Deal damage to an enemy, applying its class defense.
-  -- @param enemy - The enemy to damage.
-  -- @return killed - True if this hit brought the enemy to 0 health.
-  declare function damage_enemy(enemy: Entity, amount: number): boolean
-  ```
+The 0.3.x crate pins `ladfile = 0.24.0` because `ladfile` is part of this
+crate's public API and the 0.24 format is not compatible with older schemas.
+BMS 0.24 uses Bevy 0.20.0; the integration-test workspace pins that exact
+Bevy version as well.
 
-  (Per-*field* docs cannot be emitted: `LadNamedField` carries no documentation,
-  so the LAD format does not record them.)
-- **Typed `construct` payloads.** `construct` takes an untyped
-  `{ [string]: any }`, and Luau cannot derive a payload type from the
-  registration's `T`, so the backend exports a payload alias per type:
+## What is generated
 
-  ```luau
-  export type VelocityInit = { x: number?, y: number?, z: number? }
-  export type StanceInit = { variant: StanceVariant }
+- **Reflected types.** Named types in the LAD file become Luau extern types.
+  Struct fields keep their declared types; enum struct-variant fields are
+  optional and same-named fields are unioned across variants.
+- **Namespace imports.** Each LAD namespace becomes a typed Luau table, and
+  string-literal overloads of `import_namespace` return the matching table.
+  For example, the generated type for `import_namespace("game")` exposes the
+  functions and values registered in the `game` namespace.
+- **Type values and registrations.** LAD `Type<T>` values use the registered
+  runtime registration type parameterized by `T`, intersected with the static
+  members table for the reflected type. This preserves BMS 0.24's explicit
+  type-value and generic-signature metadata instead of inferring registrations
+  from argument positions.
+- **Generic templates and methods.** `ladfile.generic_types` becomes generic
+  extern type declarations. Generic parameters in function signatures and
+  concrete type layouts are retained.
+- **Method receivers.** The explicit LAD receiver flag controls whether a
+  function is emitted as an instance method and whether its first argument is
+  implicit in Luau method-call syntax.
+- **Enum metadata.** Enums export a variant-name union
+  (`export type StanceVariant = "Idle" | "Aggressive"`) and a static type
+  table for variant-specific functions.
+- **Constructor payload aliases.** With the default options, named struct
+  layouts produce `<Type>Init` aliases based on LAD's default-field metadata.
+  Disable them with `Options::init_types = false` or `--no-init-types` to
+  reduce output size and analysis time.
+- **Documentation.** Type, function, argument, and return documentation is
+  emitted as Luau comments. Reserved field names are preserved with quoted
+  table keys; names that cannot be used as Luau identifiers are not fabricated
+  as renamed function members.
 
-  local payload: VelocityInit = { x = 1, y = 2, z = 3 }
-  world.insert_component(e, types.Velocity, construct(types.Velocity, payload))
-  ```
-
-  Entries are optional because BMS applies the payload over `Default`. This
-  catches wrong value types and bad enum variant names. It does **not** catch a
-  misspelled key — Luau permits extra properties in a table literal. Types only;
-  nothing is claimed to exist at runtime.
-
-  These are the one part of the output worth weighing: on a full Bevy registry
-  they add ~10% to the file and ~35% to `luau-lsp analyze` time, paid on every
-  check. Turn them off with `Options::init_types` / `--no-init-types` if your
-  scripts rarely call `construct`.
-- **One member per distinct signature.** BMS registers some functions more than
-  once (operator impls arrive both with argument names and without). `luau-lsp`
-  merges duplicate members into an overload set, so the copies were never
-  *wrong*, just repeated — they inflate a file that already strains luau's
-  inference budgets and make "no overload matched" list the same candidate
-  twice. Copies that render identically collapse to the best-documented one;
-  genuinely distinct overloads are all kept.
-- **Phantom-typed registrations.** BMS's dynamic world API (`get_component`,
-  `insert_component`, `get_resource`, `construct`, …) traffics in runtime
-  `ReflectReference` proxies whose concrete type the LAD file can't name. To
-  type it anyway, the backend emits phantom brands and generic signatures:
-
-  ```luau
-  export type Reg<T> = ScriptComponentRegistration & { __component: T }
-
-  declare extern type World with
-      get_component: <T>(entity: Entity, registration: Reg<T>) -> T?
-      insert_component: <T>(entity: Entity, registration: Reg<T>, value: T) -> nil
-      ...
-  ```
-
-  and types the `types` global as a closed table
-  (`types: { Velocity: Reg<Velocity>, … }`), so
-  `world.get_component(e, types.Velocity)` infers `Velocity?` with **zero
-  casts**, and inserting the wrong component value is a compile error.
-  Script-registered dynamic components join with one cast:
-  `world.register_new_component("EnemyData") :: Reg<EnemyData>`. The phantom
-  field never exists at runtime; it only carries `T` for the checker. The
-  rewrite is **shape-driven** (a registration argument paired with
-  `ReflectReference` in return/value position), not keyed to function names.
-- **Enum variants, typed.** Every enum exports a variant-name union and — when
-  the registry records the backing `ReflectReference::variant_name` function —
-  narrows the inherited `variant_name` method to it:
-
-  ```luau
-  export type StanceVariant = "Idle" | "Aggressive"
-  declare extern type Stance extends ReflectReference with
-      function variant_name(self): StanceVariant
-  end
-  ```
-
-  so `if stance:variant_name() == "Sleepy"` is a compile error ("cannot be
-  compared"). Named fields of struct variants become optional members (they
-  may belong to an inactive variant); same-named fields of different types
-  union.
-- **`ReflectReference` as a base class.** Every script-visible value of a
-  declared class is a reference proxy at runtime, resolving fields first and
-  falling back to the `ReflectReference`-namespaced functions. The backend
-  mirrors that: it declares `ReflectReference` with its methods
-  (`display`, `iter`, `len`, `variant_name`, …) and every class `extends` it —
-  subclass members shadow base methods exactly as runtime dispatch does. In
-  *signatures* the reference primitive still renders as `any`/`T`; the class
-  exists to grant the shared methods.
-- **Honest keyword handling.** A binding whose name is a reserved Luau keyword is
-  *skipped* (a renamed alias like `end_` would have nothing backing it at
-  runtime). Reserved struct-field names are preserved via a quoted key
-  (`["end"]: T`), which *is* backed by reflect index access.
-- **Graceful fallback.** Anything that stays genuinely dynamic (`ScriptValue`
-  payloads, `DynamicFunction` callbacks, asset handles, query results) becomes
-  `any`, which Luau treats permissively, so scripts still type-check.
+Unsupported or deliberately dynamic shapes fall back to `any`. Positional
+fields in tuple structs and tuple variants are currently omitted because the
+LAD shape does not provide named Luau table fields for them. Methods recorded
+only on a generic type's individual instantiations are not yet projected onto
+the generic template; methods attached to concrete LAD type definitions are
+emitted. Callback argument signatures are not available from the LAD callback
+registry. These limits are preferable to emitting misleading, invalid
+declarations.
 
 ## Install
 
 ```bash
-cargo add luau_lad_backend          # library / generation-pipeline processor
-cargo install luau_lad_backend      # the `lad-luau` CLI
+cargo add luau_lad_backend
+cargo install luau_lad_backend
 ```
-
-| `luau_lad_backend` | `bevy_mod_scripting` | Bevy | MSRV |
-| --- | --- | --- | --- |
-| 0.2 | 0.20 – 0.21 | 0.18 – 0.19 | 1.95 |
-| 0.1 | 0.17 – 0.19 | 0.16 – 0.18 | 1.89 |
-
-Each release spans a range of BMS versions rather than pinning one: `ladfile` is
-a public dependency here, so cargo settles it on whatever your project's BMS
-already pulls in. The MSRV is inherited, not chosen: it is whatever `bevy_ecs`
-demands through `ladfile`.
-
-Definitions are emitted in Luau's extern-type syntax
-(`declare extern type X with … end`), verified against `luau-lsp` 1.45 through
-1.69. 1.69 dropped the older `declare class … end` spelling; every version
-tested below it accepts both, so there is no version this costs you.
 
 ## Usage
 
@@ -151,26 +84,31 @@ tested below it accepts both, so there is no version this costs you.
 let lad = ladfile::parse_lad_file(json)?;
 let defs: String = luau_lad_backend::lad_to_luau(&lad);
 
-// …or with the optional parts turned off:
+// Or omit constructor-payload aliases:
 use luau_lad_backend::{lad_to_luau_with, Options};
 let defs = lad_to_luau_with(&lad, &Options { init_types: false });
 ```
 
-### As a generation-pipeline processor
+### As a BMS generation-pipeline processor
 
-`LuauLadPlugin` implements `ladfile::LadFilePlugin`, so it drops into BMS's
-`ScriptingFilesGenerationPlugin` processor list:
+`LuauLadPlugin` implements `ladfile::LadFilePlugin` and can be added to the
+LAD generation processor list. When your application imports BMS's generation
+settings directly, declare `ladfile_builder` as a direct dependency too (Rust
+code cannot import a transitive dependency):
+
+```toml
+ladfile_builder = { version = "=0.24.0", default-features = false }
+luau_lad_backend = { path = "../luau_lad_backend" }
+```
 
 ```rust
+use ladfile_builder::plugin::LadFileSettings;
 use luau_lad_backend::LuauLadPlugin;
 
 let mut settings = LadFileSettings::default();
-settings.processors.push(Box::new(LuauLadPlugin::default())); // writes bindings.d.luau
-
-// Optionally drop the required luau-lsp flags next to the definitions, so build
-// scripts and editor configs read one generated list instead of hard-coding it.
 settings.processors.push(Box::new(LuauLadPlugin {
-    fflags_filename: Some("fflags.txt".into()),
+    // The default output is luau/bindings.d.luau, separate from BMS's LuaLS files.
+    fflags_filename: Some("luau/fflags.txt".into()),
     ..Default::default()
 }));
 ```
@@ -178,98 +116,116 @@ settings.processors.push(Box::new(LuauLadPlugin {
 ### As a CLI
 
 ```bash
-lad-luau bindings.lad.json bindings.d.luau   # or omit the output path for stdout
-lad-luau --check bindings.lad.json bindings.d.luau   # CI: fail if committed defs are stale
-lad-luau --fflags                            # print the analyze flags, one per line
-lad-luau --no-init-types bindings.lad.json bindings.d.luau   # smaller, faster to analyze
+lad-luau bindings.lad.json bindings.d.luau
+lad-luau --check bindings.lad.json bindings.d.luau
+lad-luau --fflags
+lad-luau --no-init-types bindings.lad.json bindings.d.luau
 lad-luau --help
 ```
 
-`--check` regenerates in memory and compares against the file on disk, reporting
-the first differing line and exiting non-zero — the check every project that
-commits its definitions needs.
+`--check` regenerates the definitions in memory and compares them with the
+file on disk, returning a non-zero exit code when the committed file is stale.
+Without an output path, `lad-luau` writes the generated definitions to stdout.
 
-Then point `luau-lsp` at the result:
+BMS 0.24 moved most script-facing APIs into namespaces. A typical script now
+starts with imports such as:
+
+```luau
+local bms = import_namespace("bms")
+local world = bms.world
+local math = import_namespace("math")
+local transform = import_namespace("transform")
+```
+
+The backend emits typed overloads for namespaces present in the LAD file. To
+analyze scripts, point `luau-lsp` at the generated definition file:
 
 ```bash
-luau-lsp analyze --defs=bindings.d.luau scripts/level1.luau
+luau-lsp analyze --defs=assets/lua/definitions/luau/bindings.d.luau scripts/level1.luau
 ```
 
 ```jsonc
-// .vscode/settings.json
-{ "luau-lsp.types.definitionFiles": ["bindings.d.luau"] }
+// .vscode/settings.json — also available as examples/vscode-luau-lsp-settings.json.
+// Paths are relative to your workspace root.
+{
+  "luau-lsp.platform.type": "standard",
+  "luau-lsp.types.definitionFiles": [
+    "assets/lua/definitions/luau/bindings.d.luau"
+  ],
+  // BMS also emits LuaLS/EmmyLua `.d.lua` files when its
+  // `lua_language_server_files` feature is enabled. They are not Luau definitions.
+  "luau-lsp.ignoreGlobs": [
+    "**/assets/lua/definitions/*.d.lua",
+    "**/assets/lua/definitions/**/*.d.lua"
+  ],
+  "luau-lsp.fflags.override": {
+    "LuauTypeInferIterationLimit": "10000000",
+    "LuauTarjanChildLimit": "1000000",
+    "LuauTypeCloneIterationLimit": "10000000",
+    "LuauSolverConstraintLimit": "100000",
+    "LuauTypeInferRecursionLimit": "2000"
+  }
+}
 ```
+
+### Important: BMS also writes LuaLS files
+
+When BMS is built with `lua_language_server_files`, its generation pipeline writes
+`bindings.d.lua` and one `bindings.<namespace>.d.lua` file per namespace. Those
+files use LuaLS/EmmyLua annotations (`---@class`, `---@field`, and so on); they
+are **not** Luau definition files and must not be treated as Luau source or passed
+to `luau-lsp`. The backend writes its native `bindings.d.luau` to the separate
+`luau/` subdirectory by default. Keep the two dialects separate and have
+`luau-lsp` ignore the BMS `*.d.lua` files as shown in the settings example. After
+changing `ignoreGlobs`, close any already-open generated `.d.lua` tabs and restart
+the Luau language server so the workspace index is rebuilt.
+
+If you intentionally use both languages, configure LuaLS separately with a
+`.luarc.json` such as:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+  "workspace.library": ["assets/lua/definitions"],
+  "workspace.preloadFileSize": 10000
+}
+```
+
+The `workspace.library` directory must contain the root and per-namespace
+`.d.lua` files, as described in the [BMS editor-support documentation](https://makspll.github.io/bevy_mod_scripting/ScriptTooling/introduction.html).
+In the supplied BMS 0.24 output, the root `bindings.d.lua` already declares
+`ReflectReference` and `NoFields`; `bindings.math.d.lua`, `bindings.ecs.d.lua`,
+and `bindings.bms.d.lua` declare the namespace types referenced by the other
+files. Therefore, do not add a duplicate `NoFields` alias. If LuaLS still reports
+these names as undefined, its workspace library is not indexing the whole
+output directory. The matching config example is `examples/luarc.json`. If the
+project is Luau-only, disable the LuaLS extension for this workspace instead.
+
+The five `luau-lsp` inference flags needed by large reflection registries are
+included in every generated file's header, exposed as `FFLAGS` and
+`fflags_args()`, and available through `lad-luau --fflags` or
+`LuauLadPlugin::fflags_filename`.
 
 ## Testing
 
-Three layers, in increasing fidelity:
+The workspace includes three levels of checks:
 
-1. **Unit tests** (`src/lib.rs`) — the conversion itself, including dynamic
-   type declaration and reserved-keyword handling.
-2. **Lightweight luau-lsp test** (`tests/luau_lsp.rs`) — generates a `.d.luau`
-   from the bundled example LAD file and has `luau-lsp` type-check a correct and a
-   wrong script (a missing field on a generated class, a bad argument).
-3. **Full Bevy integration** (`bevy_integration_test/`, a separate, non-published
-   workspace member) — builds a real headless Bevy + `bevy_mod_scripting` app,
-   dumps its *live reflection registry* to a LAD file, converts it with this
-   crate, and has `luau-lsp` type-check scripts that use the generated component
-   classes and host globals. This keeps Bevy/BMS out of the published crate's
-   dependency tree.
+1. Unit tests for LAD 0.24 conversion, namespaced imports, generic types,
+   constructor aliases, and Luau field-key handling.
+2. A `luau-lsp` test using the bundled BMS 0.24 example LAD file. It checks a
+   valid namespace/type access and ensures invalid fields and enum variants are
+   rejected.
+3. A separate, non-published `bevy_integration_test` crate that builds a
+   headless Bevy 0.20 + BMS 0.24 application, generates a live LAD file, and
+   checks a custom namespace and reflected component types.
 
-`luau-lsp` is an external binary, so the type-checking layers run only when it's
-found (via `LUAU_LSP` or `PATH`) and skip cleanly otherwise:
+`luau-lsp` is an external binary. The analyzer tests run when it is available
+through `LUAU_LSP` or `PATH`, and otherwise skip with a notice:
 
 ```bash
-LUAU_LSP=/path/to/luau-lsp cargo test --workspace   # everything
-LUAU_LSP=/path/to/luau-lsp cargo test               # core crate only (fast)
+LUAU_LSP=/path/to/luau-lsp cargo test --workspace
+cargo test --workspace
 ```
-
-## Status & scope
-
-This is an early, standalone backend. It covers the common surface (named struct
-fields, enum variants with typed `variant_name`, associated functions incl. the
-inherited `ReflectReference` surface, host globals/functions, typed registration
-access, `construct` payloads, and function/argument/return documentation). Not
-yet handled, and resolved to `any` / omitted for now: tuple-struct and
-tuple-variant positional fields, generic monomorphisations (declared once under
-the base name), asset handles (`Handle<T>` ↔ `T` isn't recorded in the LAD
-format), per-query typing of `ScriptQueryResult:components()` (not expressible
-in Luau; read via the typed `get_component` instead), and callback signatures
-for `register_callback` (not in the reflection registry). Contributions and
-feedback welcome.
-
-Two limits worth knowing before you rely on them:
-
-- **Misspelled `construct` payload keys are not caught.** Luau permits extra
-  properties in a table literal, so `<Class>Init` buys value types and enum
-  variant names, not key spelling. Neither the old solver nor `LuauSolverV2`
-  flags the extra key.
-- **Per-field documentation cannot be emitted at all**, because `LadNamedField`
-  has no documentation field — the LAD format does not carry it. Only a type's
-  own docstring and its functions' docs survive the dump.
-
-### Large registries and luau's inference budgets
-
-A full Bevy app easily produces hundreds of classes plus the closed `types`
-table over all of them, which can exceed luau's default type-inference limits
-("Code is too complex to typecheck"). The flags to raise them are the crate's
-business, not each project's, so every generated file names them in its header
-comment, `lad-luau --fflags` prints them, `LuauLadPlugin::fflags_filename`
-writes them to a companion file for tooling to read, and `FFLAGS` /
-`fflags_args()` expose them to build scripts.
-
-```bash
-luau-lsp analyze $(lad-luau --fflags) --defs=bindings.d.luau scripts/*.luau
-```
-
-(or the equivalent `luau-lsp.fflags.override` block in VS Code settings).
-
-The one lever on output size is overload deduplication, which is unconditional
-(208 redundant members out of 4942 on a real Bevy 0.18 registry). Dropping
-"unreachable" types is not offered: it was tried, and on that same registry it
-removed exactly one class of 771 — nearly everything registered is a component,
-a resource, or reachable from one through a field or method signature, so a full
-registry is genuinely almost all reachable.
 
 ## License
 

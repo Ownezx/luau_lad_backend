@@ -15,9 +15,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A script that uses the generated API correctly: the typed global function, a
-/// field on a generated class (reached via an honest cast), and the exported
-/// enum variant-name union. Must type-check.
+/// A script that uses the generated API correctly: a typed global builtin, an
+/// imported namespace/type value, a reflected field, and the enum variant union.
 const GOOD_SCRIPT: &str = "\
 --!strict
 local n: number = hello_world(1)
@@ -60,8 +59,12 @@ fn luau_lsp_typechecks_generated_defs() {
 
     // Sanity: the surface the scripts rely on must actually be present.
     assert!(
-        defs.contains("declare function hello_world(arg1: number): number"),
-        "generated defs missing the expected global function:\n{defs}"
+        defs.contains("declare function hello_world(arg1: number, ...any): number"),
+        "generated defs missing the expected variadic global function:\n{defs}"
+    );
+    assert!(
+        defs.contains("import_namespace(name: \"ladfile_builder\")"),
+        "generated defs missing the example namespace import:\n{defs}"
     );
 
     let dir = scratch_dir("bms_luau_lsp");
@@ -114,8 +117,12 @@ fn luau_lsp_typechecks_generated_defs() {
 
 /// Run `luau-lsp analyze --defs=<defs> <script>` and capture its output.
 fn analyze(lsp: &Path, defs: &Path, script: &Path) -> Output {
-    let out = Command::new(lsp)
-        .arg("analyze")
+    let mut command = Command::new(lsp);
+    command.arg("analyze");
+    for flag in luau_lad_backend::fflags_args().lines() {
+        command.arg(flag);
+    }
+    let out = command
         .arg(format!("--defs={}", defs.display()))
         .arg(script)
         .output()

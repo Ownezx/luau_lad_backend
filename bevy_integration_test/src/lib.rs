@@ -1,6 +1,5 @@
-//! A minimal but *real* Bevy + `bevy_mod_scripting` scripting environment, used by
-//! the integration tests to produce a genuine LAD file from a live reflection
-//! registry — the same way a real game would generate its script API.
+//! A minimal real Bevy + BMS 0.24 application used to generate a live LAD file
+//! for the integration tests.
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +8,6 @@ use bevy::log::LogPlugin;
 use bevy::prelude::*;
 use bevy::MinimalPlugins;
 use bevy_mod_scripting::prelude::*;
-use bevy_mod_scripting::BMSPlugin;
 use ladfile_builder::plugin::ScriptingFilesGenerationPlugin;
 
 /// World position of an entity.
@@ -46,8 +44,7 @@ pub struct Health {
     pub max: f64,
 }
 
-/// Behavior stance of an entity — a plain unit enum, exercising the exported
-/// variant-name union and the typed `variant_name` override.
+/// Behavior stance of an entity.
 #[derive(Reflect, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[reflect(Default)]
 pub enum Stance {
@@ -58,9 +55,7 @@ pub enum Stance {
     Aggressive,
 }
 
-/// Build a headless scripting app, register the components and host globals, and
-/// dump the reflection registry to a LAD file in `out_dir`. Returns the path of
-/// the written `bindings.lad.json`.
+/// Build a headless scripting app and write its BMS 0.24 LAD dump.
 pub fn generate_lad(out_dir: &Path) -> PathBuf {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
@@ -68,25 +63,29 @@ pub fn generate_lad(out_dir: &Path) -> PathBuf {
         .add_plugins(LogPlugin::default())
         .add_plugins(BMSPlugin);
 
-    // The component surface scripts get to see.
     app.register_type::<Position>()
         .register_type::<Velocity>()
         .register_type::<Health>()
         .register_type::<Stance>();
 
-    // Host functions exposed to scripts as plain Luau globals.
-    {
-        let world = app.world_mut();
-        NamespaceBuilder::<GlobalNamespace>::new_unregistered(world)
-            .register("info", |msg: String| {
+    // BMS 0.24 no longer exposes custom functions as global functions. The
+    // script obtains them from `import_namespace("game")`.
+    NamespaceBuilder::<NamespaceMembers>::in_namespace(app.world_mut(), "game")
+        .register_documented(
+            "info",
+            |msg: String| {
                 info!("[script] {msg}");
-            })
-            .register("magnitude", |x: f64, y: f64, z: f64| {
-                (x * x + y * y + z * z).sqrt()
-            });
-    }
+            },
+            "Write an informational message to the application log.",
+            &["msg"],
+        )
+        .register_documented(
+            "magnitude",
+            |x: f64, y: f64, z: f64| (x * x + y * y + z * z).sqrt(),
+            "Return the Euclidean magnitude of a 3D vector.",
+            &["x", "y", "z"],
+        );
 
-    // Dump the registry to a LAD file on the Startup schedule.
     app.add_plugins(ScriptingFilesGenerationPlugin::new(
         true,
         out_dir.to_path_buf(),
@@ -98,7 +97,7 @@ pub fn generate_lad(out_dir: &Path) -> PathBuf {
 
     app.finish();
     app.cleanup();
-    app.update(); // runs the generation system, writing the LAD file
+    app.update();
 
     out_dir.join("bindings.lad.json")
 }
