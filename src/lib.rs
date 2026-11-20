@@ -232,50 +232,76 @@ impl<'a> Converter<'a> {
 
     fn render_types(&self, out: &mut String) {
         let mut types: Vec<_> = self.names.iter().collect();
-        types.sort_by(|a, b| a.1.cmp(b.1));
+        types.sort_by(|a, b| {
+            // Extern-type inheritance is resolved when luau-lsp prototypes a
+            // declaration. The common reflection base must therefore be
+            // introduced before every reflected type that extends it.
+            (a.1 != "ReflectReference")
+                .cmp(&(b.1 != "ReflectReference"))
+                .then_with(|| a.1.cmp(b.1))
+        });
 
-        for (id, name) in types {
+        // Emit every nominal extern type before aliases that mention it. In
+        // definition files, the extern declarations are prototyped together;
+        // their property and method signatures are resolved after the
+        // declarations have introduced all nominal names. Interleaving
+        // `AabbType` (which returns `Aabb`) before the `Aabb` declaration
+        // makes luau-lsp report `Unknown type 'Aabb'`.
+        for &(id, name) in &types {
             let def = &self.lad.types[id];
+            if self.registration_types.contains(id) {
+                continue;
+            }
             if let Some(doc) = &def.documentation {
                 push_doc(out, doc, "");
+            }
+            self.render_extern_type(out, name, def);
+        }
+
+        // Structural aliases are emitted only after all nominal names exist.
+        // This includes constructors returning their owner type, `*Init`
+        // payloads, enum static tables, and generic registration carriers.
+        for &(id, name) in &types {
+            let def = &self.lad.types[id];
+            if self.registration_types.contains(id) {
+                if let Some(doc) = &def.documentation {
+                    push_doc(out, doc, "");
+                }
             }
             self.render_variant_alias(out, name, &def.layout);
             if self.options.init_types {
                 self.render_init_alias(out, name, def);
             }
             self.render_static_type_alias(out, id, name, def);
-
-            // Registration carriers are generic structural aliases. Other
-            // reflected types use luau-lsp's definition-file `extern type`
-            // declaration form, which supports nominal identity and inherited
-            // members.
             if self.registration_types.contains(id) {
                 self.render_registration_alias(out, name, def);
-                continue;
             }
-            let extends = if name != "ReflectReference" && def.metadata.is_reflect {
-                " extends ReflectReference"
-            } else {
-                ""
-            };
-            out.push_str(&format!("declare extern type {name}{extends} with\n"));
-            self.render_layout_members(out, &def.layout, def, name);
-
-            // Instance methods belong to the nominal reflected type. Static
-            // associated functions (including constructors such as `new`)
-            // are already emitted on the corresponding `{name}Type` alias.
-            let mut functions: Vec<_> = def
-                .associated_functions
-                .iter()
-                .filter_map(|id| self.lad.functions.get(id))
-                .filter(|function| function.receiver)
-                .collect();
-            functions.sort_by(|a, b| a.identifier.cmp(&b.identifier));
-            for function in dedupe_overloads(functions) {
-                self.render_type_function(out, name, function);
-            }
-            out.push_str("end\n\n");
         }
+    }
+
+    fn render_extern_type(&self, out: &mut String, name: &str, def: &ladfile::LadTypeDefinition) {
+        let extends = if name != "ReflectReference" && def.metadata.is_reflect {
+            " extends ReflectReference"
+        } else {
+            ""
+        };
+        out.push_str(&format!("declare extern type {name}{extends} with\n"));
+        self.render_layout_members(out, &def.layout, def, name);
+
+        // Instance methods belong to the nominal reflected type. Static
+        // associated functions (including constructors such as `new`) are
+        // emitted later on the corresponding `{name}Type` alias.
+        let mut functions: Vec<_> = def
+            .associated_functions
+            .iter()
+            .filter_map(|id| self.lad.functions.get(id))
+            .filter(|function| function.receiver)
+            .collect();
+        functions.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+        for function in dedupe_overloads(functions) {
+            self.render_type_function(out, name, function);
+        }
+        out.push_str("end\n\n");
     }
 
     fn render_static_type_alias(
@@ -1203,8 +1229,7 @@ mod tests {
         );
         assert!(defs.contains("export type ImportNamespace ="), "{defs}");
 
-        let binding = Options::default();
-        let converter = Converter::new(&lad, &binding);
+        let converter = Converter::new(&lad, &Options::default());
         for (namespace, expected_type) in &converter.namespace_names {
             let escaped = escape_luau_string(namespace);
             assert!(
@@ -1257,6 +1282,61 @@ mod tests {
         let args = fflags_args();
         assert_eq!(args.lines().count(), FFLAGS.len());
         assert!(args.contains("--flag:LuauTypeInferIterationLimit=10000000"));
+    }
+
+    #[test]
+    fn nominal_types_are_declared_before_aliases_and_reflection_base_is_first() {
+        let lad = ladfile::parse_lad_file(ladfile::EXAMPLE_LADFILE).unwrap();
+        let defs = lad_to_luau(&lad);
+
+        let first_alias = defs.find("export type ").expect("fixture emits aliases");
+        let mut first_extern = None;
+        let mut saw_alias = false;
+        for (_line_index, line) in defs.lines().enumerate() {
+            if line.starts_with("export type ") {
+                saw_alias = true;
+            }
+            if line.starts_with("declare extern type ") {
+                assert!(
+                    !saw_alias,
+                    "nominal extern declarations must precede structural aliases; offending line {line_index}: {line}"
+                );
+                first_extern.get_or_insert(line);
+            }
+        }
+        assert!(
+            first_extern.is_some(),
+            "fixture should contain extern types"
+        );
+
+        if let (Some(base_pos), Some(first_derived_pos)) = (
+            defs.find("declare extern type ReflectReference"),
+            defs.find(" extends ReflectReference with"),
+        ) {
+            let first_extern_pos = defs.find("declare extern type ").unwrap();
+            assert_eq!(
+                base_pos, first_extern_pos,
+                "reflection base must be declared first"
+            );
+            assert!(base_pos < first_derived_pos);
+        }
+
+        let converter = Converter::new(&lad, &Options::default());
+        for (id, name) in &converter.names {
+            if converter.registration_types.contains(id) {
+                continue;
+            }
+            let declaration = defs
+                .find(&format!("declare extern type {name}"))
+                .unwrap_or_else(|| panic!("missing extern declaration for {name}"));
+            let static_alias = defs
+                .find(&format!("export type {name}Type"))
+                .unwrap_or_else(|| panic!("missing static type alias for {name}"));
+            assert!(
+                declaration < static_alias && static_alias > first_alias,
+                "{name} aliases must follow nominal declarations"
+            );
+        }
     }
 
     #[test]
