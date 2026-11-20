@@ -5,6 +5,12 @@
 //! parameters, receiver information, type values, and enum-variant functions
 //! explicitly. This backend preserves that model when producing Luau
 //! definitions for `luau-lsp`.
+//!
+//! `import_namespace` is emitted as a single global whose type is an
+//! intersection of namespace-specific function signatures. Luau uses
+//! intersections to represent callable overloads; emitting several
+//! `declare function import_namespace(...)` statements does not reliably
+//! create overloads and can leave calls typed as `any`.
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -112,7 +118,11 @@ struct Converter<'a> {
 impl<'a> Converter<'a> {
     fn new(lad: &'a LadFile, options: &'a Options) -> Self {
         let mut used = HashSet::new();
-        let mut names = HashMap::new();
+
+        // Reserve generated top-level aliases before allocating reflected and
+        // generic type names, so a user type cannot shadow the import callable.
+        used.insert("ImportNamespace".to_string());
+
         let has_reflect_reference = lad.types.values().any(|def| {
             matches!(
                 def.metadata.mapped_to_primitive_kind.as_ref(),
@@ -123,6 +133,7 @@ impl<'a> Converter<'a> {
             used.insert("ReflectReference".to_string());
         }
 
+        let mut names = HashMap::new();
         let mut ids: Vec<_> = lad.types.keys().cloned().collect();
         ids.sort_by(|a, b| {
             lad.types[a]
@@ -167,7 +178,11 @@ impl<'a> Converter<'a> {
         let mut namespaces: Vec<_> = lad.namespaces.keys().map(|s| s.to_string()).collect();
         namespaces.sort();
         for ns in namespaces {
-            let candidate = format!("Namespace_{}", sanitize(&ns));
+            let candidate = if ns.is_empty() {
+                "Namespace_root".to_string()
+            } else {
+                format!("Namespace_{}", sanitize(&ns))
+            };
             let name = unique_name(&mut used, &candidate);
             namespace_names.insert(ns, name);
         }
@@ -202,15 +217,16 @@ impl<'a> Converter<'a> {
         for (flag, value) in FFLAGS {
             out.push_str(&format!("--     --flag:{flag}={value}\n"));
         }
-        out.push_str("\n");
+        out.push('\n');
 
-        // Types and generic templates are declared before namespace tables. Luau
-        // definition files permit forward references, but this order is easier to
-        // inspect and keeps the import_namespace aliases near the end.
+        // Types and generic templates are declared before namespace tables.
+        // The namespace import callable is emitted last, after all return types
+        // have been declared.
         self.render_types(&mut out);
         self.render_generic_types(&mut out);
         self.render_global_functions(&mut out);
         self.render_namespaces(&mut out);
+        self.render_import_namespace(&mut out);
         out
     }
 
@@ -229,28 +245,30 @@ impl<'a> Converter<'a> {
             }
             self.render_static_type_alias(out, id, name, def);
 
-            // Concrete `types` are already monomorphized in LAD 0.24. Only
-            // registration carriers become generic here; reusable templates
-            // are declared separately from `lad.generic_types`.
-            let generics = if self.registration_types.contains(id) {
-                "<T>".to_string()
-            } else {
-                String::new()
-            };
+            // Registration carriers are generic structural aliases. Other
+            // reflected types use luau-lsp's definition-file `extern type`
+            // declaration form, which supports nominal identity and inherited
+            // members.
+            if self.registration_types.contains(id) {
+                self.render_registration_alias(out, name, def);
+                continue;
+            }
             let extends = if name != "ReflectReference" && def.metadata.is_reflect {
                 " extends ReflectReference"
             } else {
                 ""
             };
-            out.push_str(&format!(
-                "declare extern type {name}{generics}{extends} with\n"
-            ));
+            out.push_str(&format!("declare extern type {name}{extends} with\n"));
             self.render_layout_members(out, &def.layout, def, name);
 
+            // Instance methods belong to the nominal reflected type. Static
+            // associated functions (including constructors such as `new`)
+            // are already emitted on the corresponding `{name}Type` alias.
             let mut functions: Vec<_> = def
                 .associated_functions
                 .iter()
                 .filter_map(|id| self.lad.functions.get(id))
+                .filter(|function| function.receiver)
                 .collect();
             functions.sort_by(|a, b| a.identifier.cmp(&b.identifier));
             for function in dedupe_overloads(functions) {
@@ -335,12 +353,136 @@ impl<'a> Converter<'a> {
                 .map(|p| sanitize(p))
                 .collect::<Vec<_>>()
                 .join(", ");
-            out.push_str(&format!("declare extern type {name}<{params}> with\n"));
-            self.render_layout_members_generic(out, &def.layout, name);
+            out.push_str(&format!("export type {name}<{params}> = "));
+            out.push_str(&self.generic_layout_type(&def.layout));
+            out.push_str("\n\n");
+        }
+    }
 
-            // The generic layout is described here; members tied only to a
-            // concrete instantiation remain on the instantiated type in LAD.
-            out.push_str("end\n\n");
+    /// Render a generic registration carrier as a structural type alias.
+    /// These are the `Registration<T>` values used alongside concrete type
+    /// constructor tables in namespace members.
+    fn render_registration_alias(
+        &self,
+        out: &mut String,
+        name: &str,
+        def: &ladfile::LadTypeDefinition,
+    ) {
+        out.push_str(&format!("export type {name}<T> = {{\n"));
+
+        match &def.layout {
+            LadTypeLayout::Opaque => {}
+            LadTypeLayout::MonoVariant(variant) => {
+                self.render_alias_variant_fields(out, variant);
+            }
+            LadTypeLayout::Enum(variants) => {
+                // A registration table may expose fields from several enum
+                // variants. Mark each field optional because it is not present
+                // on every variant.
+                let mut fields: std::collections::BTreeMap<String, Vec<String>> =
+                    std::collections::BTreeMap::new();
+                for variant in variants {
+                    if let LadVariant::Struct {
+                        fields: variant_fields,
+                        ..
+                    } = variant
+                    {
+                        for field in variant_fields {
+                            fields
+                                .entry(field.name.clone())
+                                .or_default()
+                                .push(self.kind(&field.type_));
+                        }
+                    }
+                }
+                for (field, types) in fields {
+                    let ty = unique_types(types).join(" | ");
+                    out.push_str(&format!(
+                        "\t{}: {},\n",
+                        field_key(&field),
+                        optional_type(&ty)
+                    ));
+                }
+            }
+        }
+
+        let mut functions: Vec<_> = def
+            .associated_functions
+            .iter()
+            .filter_map(|id| self.lad.functions.get(id))
+            .collect();
+        functions.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+        for function in dedupe_overloads(functions) {
+            let Some(member_name) = callable_name(&function.identifier) else {
+                continue;
+            };
+            let signature = self.function_type_with_alias_receiver(function, name);
+            out.push_str(&format!("\t{member_name}: {signature},\n"));
+        }
+        out.push_str("}\n");
+    }
+
+    fn render_alias_variant_fields(&self, out: &mut String, variant: &LadVariant) {
+        if let LadVariant::Struct { fields, .. } = variant {
+            for field in fields {
+                out.push_str(&format!(
+                    "\t{}: {},\n",
+                    field_key(&field.name),
+                    self.kind(&field.type_)
+                ));
+            }
+        }
+    }
+
+    fn function_type_with_alias_receiver(&self, function: &LadFunction, owner: &str) -> String {
+        let mut args = function.arguments.iter();
+        if function.receiver {
+            let _ = args.next();
+        }
+        let args: Vec<_> = args.collect();
+        let mut params = Vec::new();
+        if function.receiver {
+            params.push(format!("self: {owner}<T>"));
+        }
+        if !args.is_empty() {
+            params.push(self.params(&args));
+        }
+        let ret = self.kind(&function.return_type.kind);
+        format!(
+            "{}({}) -> {ret}",
+            generic_param_list(&function.generics),
+            params.join(", ")
+        )
+    }
+
+    fn generic_layout_type(&self, layout: &LadTypeLayout) -> String {
+        match layout {
+            LadTypeLayout::Opaque => "{}".to_string(),
+            LadTypeLayout::MonoVariant(variant) => self.generic_variant_type(variant),
+            LadTypeLayout::Enum(variants) => {
+                if variants.is_empty() {
+                    "{}".to_string()
+                } else {
+                    variants
+                        .iter()
+                        .map(|variant| self.generic_variant_type(variant))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                }
+            }
+        }
+    }
+
+    fn generic_variant_type(&self, variant: &LadVariant) -> String {
+        match variant {
+            LadVariant::Struct { fields, .. } => {
+                let members = fields
+                    .iter()
+                    .map(|field| format!("{}: {}", field_key(&field.name), self.kind(&field.type_)))
+                    .collect::<Vec<_>>();
+                format!("{{ {} }}", members.join(", "))
+            }
+            LadVariant::TupleStruct { .. } | LadVariant::Unit { .. } => "{}".to_string(),
         }
     }
 
@@ -375,25 +517,15 @@ impl<'a> Converter<'a> {
                 }
                 for (name, types) in fields {
                     let ty = unique_types(types).join(" | ");
-                    out.push_str(&format!("\t{}: ({ty})?\n", field_key(&name)));
+                    out.push_str(&format!(
+                        "\t{}: {},\n",
+                        field_key(&name),
+                        optional_type(&ty)
+                    ));
                 }
             }
         }
         let _ = owner;
-    }
-
-    fn render_layout_members_generic(&self, out: &mut String, layout: &LadTypeLayout, owner: &str) {
-        match layout {
-            LadTypeLayout::Opaque => {}
-            LadTypeLayout::MonoVariant(variant) => {
-                self.render_variant_fields_generic(out, variant, owner);
-            }
-            LadTypeLayout::Enum(variants) => {
-                for variant in variants {
-                    self.render_variant_fields_generic(out, variant, owner);
-                }
-            }
-        }
     }
 
     fn render_variant_fields(
@@ -415,22 +547,6 @@ impl<'a> Converter<'a> {
             LadVariant::Unit { .. } => {}
         }
         let _ = (def, variant_name, owner);
-    }
-
-    fn render_variant_fields_generic(&self, out: &mut String, variant: &LadVariant, _owner: &str) {
-        match variant {
-            LadVariant::Struct { fields, .. } => {
-                for field in fields {
-                    out.push_str(&format!(
-                        "\t{}: {}\n",
-                        field_key(&field.name),
-                        self.kind(&field.type_)
-                    ));
-                }
-            }
-            LadVariant::TupleStruct { .. } => {}
-            LadVariant::Unit { .. } => {}
-        }
     }
 
     fn render_variant_alias(&self, out: &mut String, name: &str, layout: &LadTypeLayout) {
@@ -458,10 +574,7 @@ impl<'a> Converter<'a> {
                 }
                 out.push_str(&format!("export type {name}Init = {{\n"));
                 for (key, ty, optional) in fields {
-                    out.push_str(&format!(
-                        "\t{key}{}: {ty},\n",
-                        if optional { "?" } else { "" }
-                    ));
+                    out.push_str(&format!("\t{key}: {},\n", optional_type_if(&ty, optional)));
                 }
                 out.push_str("}\n");
             }
@@ -486,10 +599,7 @@ impl<'a> Converter<'a> {
                             if index > 0 {
                                 out.push_str(", ");
                             }
-                            out.push_str(&format!(
-                                "{key}{}: {ty}",
-                                if *optional { "?" } else { "" }
-                            ));
+                            out.push_str(&format!("{key}: {}", optional_type_if(ty, *optional)));
                         }
                         out.push_str(&format!(" }}{suffix}"));
                     }
@@ -615,16 +725,42 @@ impl<'a> Converter<'a> {
             }
             out.push_str("}\n\n");
         }
+    }
 
-        // `import_namespace` is one of the remaining global builtins, and its
-        // result depends on a string literal. Emit one overload per known namespace.
-        for (namespace, ns_name) in &self.namespace_names {
-            out.push_str(&format!(
-                "declare function import_namespace(name: \"{}\"): {ns_name}\n",
+    /// Emit one callable type containing all statically-known namespace imports.
+    ///
+    /// Luau models overloadable callables as an intersection of function types.
+    /// A literal call such as `import_namespace("odp")` therefore resolves to
+    /// `Namespace_odp`, while the final `string -> any` arm keeps dynamic/runtime
+    /// namespaces (for example `script.game`) usable without pretending that
+    /// their members are statically known.
+    fn render_import_namespace(&self, out: &mut String) {
+        let mut namespaces: Vec<_> = self.namespace_names.iter().collect();
+        namespaces.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut signatures = Vec::with_capacity(namespaces.len() + 1);
+        for (namespace, type_name) in namespaces {
+            signatures.push(format!(
+                "((namespace: \"{}\") -> {type_name})",
                 escape_luau_string(namespace)
             ));
         }
-        out.push_str("declare function import_namespace(name: string): any\n");
+
+        // BMS supports script-created namespaces that cannot be known from a
+        // static LAD file. Keep those imports legal, but restrict them to `any`.
+        signatures.push("((namespace: string) -> any)".to_string());
+
+        out.push_str("export type ImportNamespace =\n");
+        for (index, signature) in signatures.iter().enumerate() {
+            if index == 0 {
+                out.push_str("\t");
+            } else {
+                out.push_str("\t& ");
+            }
+            out.push_str(signature);
+            out.push('\n');
+        }
+        out.push_str("\ndeclare import_namespace: ImportNamespace\n\n");
     }
 
     fn namespace_type_value(&self, type_id: &LadTypeId) -> String {
@@ -852,10 +988,9 @@ impl<'a> Converter<'a> {
                     .map(|field| {
                         let optional = field.has_default || optional_default;
                         format!(
-                            "{}{}: {}",
+                            "{}: {}",
                             field_key(&field.name),
-                            if optional { "?" } else { "" },
-                            self.kind(&field.type_)
+                            optional_type_if(&self.kind(&field.type_), optional)
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -894,6 +1029,27 @@ fn unique_types(items: impl IntoIterator<Item = String>) -> Vec<String> {
         }
     }
     result
+}
+
+/// Luau expresses an optional table property by making its value type
+/// optional (`field: Value?`), not with TypeScript's `field?: Value` syntax.
+fn optional_type(ty: &str) -> String {
+    let ty = ty.trim();
+    if ty.ends_with('?') {
+        ty.to_string()
+    } else if ty.contains(" | ") || ty.contains(" & ") {
+        format!("({ty})?")
+    } else {
+        format!("{ty}?")
+    }
+}
+
+fn optional_type_if(ty: &str, optional: bool) -> String {
+    if optional {
+        optional_type(ty)
+    } else {
+        ty.to_string()
+    }
 }
 
 fn dedupe_overloads<'a>(functions: Vec<&'a LadFunction>) -> Vec<&'a LadFunction> {
@@ -1021,13 +1177,49 @@ mod tests {
         let defs = lad_to_luau(&lad);
 
         assert!(defs.contains("declare function hello_world("), "{defs}");
+        assert!(defs.contains("export type ImportNamespace ="), "{defs}");
         assert!(
-            defs.contains("import_namespace(name: string): any"),
+            defs.contains("declare import_namespace: ImportNamespace"),
             "{defs}"
         );
+        assert!(defs.contains("((namespace: string) -> any)"), "{defs}");
         assert!(defs.contains("export type Namespace_"), "{defs}");
         assert!(defs.contains("Variant ="), "{defs}");
         assert!(defs.contains("Init ="), "{defs}");
+    }
+
+    #[test]
+    fn emits_a_single_intersection_typed_import_namespace() {
+        let lad = ladfile::parse_lad_file(ladfile::EXAMPLE_LADFILE).unwrap();
+        let defs = lad_to_luau(&lad);
+
+        assert_eq!(
+            defs.matches("declare import_namespace:").count(),
+            1,
+            "{defs}"
+        );
+        assert!(
+            !defs.contains("declare function import_namespace"),
+            "{defs}"
+        );
+        assert!(defs.contains("export type ImportNamespace ="), "{defs}");
+
+        let converter = Converter::new(&lad, &Options::default());
+        for (namespace, expected_type) in &converter.namespace_names {
+            let escaped = escape_luau_string(namespace);
+            assert!(
+                defs.contains(&format!("((namespace: \"{escaped}\") -> {expected_type})")),
+                "missing typed import signature for namespace `{namespace}` in:\n{defs}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_namespace_output_is_deterministic() {
+        let lad = ladfile::parse_lad_file(ladfile::EXAMPLE_LADFILE).unwrap();
+        let first = lad_to_luau(&lad);
+        let second = lad_to_luau(&lad);
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -1036,16 +1228,13 @@ mod tests {
         let defs = lad_to_luau(&lad);
         for namespace in lad.namespaces.keys() {
             assert!(
-                defs.contains(&format!("import_namespace(name: \"{namespace}\")")),
+                defs.contains(&format!("namespace: \"{}\"", escape_luau_string(namespace))),
                 "{defs}"
             );
         }
         for generic in lad.generic_types.values() {
             assert!(
-                defs.contains(&format!(
-                    "declare extern type {}<",
-                    sanitize(&generic.identifier)
-                )),
+                defs.contains(&format!("export type {}<", sanitize(&generic.identifier))),
                 "{defs}"
             );
         }
@@ -1057,6 +1246,10 @@ mod tests {
         let defs = lad_to_luau_with(&lad, &Options { init_types: false });
         assert!(!defs.contains("Init ="), "{defs}");
         assert!(defs.contains("declare extern type"), "{defs}");
+        assert!(
+            defs.contains("declare import_namespace: ImportNamespace"),
+            "{defs}"
+        );
     }
 
     #[test]
@@ -1079,7 +1272,35 @@ mod tests {
             !defs.contains("local namespace_"),
             "the generated Luau file should use typed namespace aliases, not LuaLS module locals"
         );
+        assert!(defs.contains("declare extern type "), "{defs}");
+        assert!(
+            !defs.contains("?:"),
+            "TypeScript-style optional keys are not valid Luau: {defs}"
+        );
+        assert!(!defs.contains("declare class "), "{defs}");
         assert!(defs.contains("export type Namespace_"), "{defs}");
+    }
+
+    #[test]
+    fn reflected_types_use_luau_lsp_extern_type_declarations() {
+        let lad = ladfile::parse_lad_file(ladfile::EXAMPLE_LADFILE).unwrap();
+        let defs = lad_to_luau(&lad);
+
+        assert!(defs.contains("declare extern type "), "{defs}");
+        assert!(defs.contains(" with\n"), "{defs}");
+        assert!(!defs.contains("declare class "), "{defs}");
+        assert!(
+            !defs.contains("declare extern type ") || defs.contains("end\n"),
+            "{defs}"
+        );
+    }
+
+    #[test]
+    fn optional_table_properties_use_luau_value_optional_syntax() {
+        assert_eq!(optional_type("Vec3A"), "Vec3A?");
+        assert_eq!(optional_type("Vec3A?"), "Vec3A?");
+        assert_eq!(optional_type("number | string"), "(number | string)?");
+        assert_eq!(optional_type_if("Vec3A", false), "Vec3A");
     }
 
     #[test]
@@ -1105,9 +1326,9 @@ mod tests {
         let flags_path = dir.join("luau/fflags.txt");
         assert!(defs_path.is_file());
         assert!(flags_path.is_file());
-        assert!(std::fs::read_to_string(defs_path)
-            .unwrap()
-            .contains("--!strict"));
+        let generated = std::fs::read_to_string(defs_path).unwrap();
+        assert!(generated.contains("--!strict"));
+        assert!(generated.contains("declare import_namespace: ImportNamespace"));
         assert_eq!(std::fs::read_to_string(flags_path).unwrap(), fflags_args());
 
         std::fs::remove_dir_all(dir).unwrap();
